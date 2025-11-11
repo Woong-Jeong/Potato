@@ -2,26 +2,67 @@
 # ------------------------------
 # Module: potato_peeling_path_generator.py
 # Purpose:
-#   - Generate helical single-curve trajectory for rotating potato
-#   - Robot moves in continuous spiral while potato rotates
-#   - Blade follows surface contour, engages only on unpeeled regions
-#   - Output: smooth 3D curve synchronized with rotation
-# Notes:
-#   - Potato rotates on Z-axis
-#   - Robot traces helical path (θ increases with Z descent)
-#   - Radial distance modulated to follow surface
+#   - Generate helical trajectory for rotating potato with ISO-scallop adaptive pitch
+#   - Robot moves in continuous spiral while potato rotates on Z-axis
+#   - Curvature-based pitch adaptation for uniform surface quality
 # ------------------------------
 
+from typing import Tuple, Optional
 import numpy as np
 import trimesh
 import open3d as o3d
 from scipy.interpolate import RectBivariateSpline, splprep, splev
-from scipy.ndimage import gaussian_filter1d
-import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter
+
+
+# ========================================
+# CONFIGURATION PARAMETERS
+# ========================================
+
+# File paths
+MESH_PATH = "../mesh/mesh_1_processed.stl"
+OUTPUT_PATH = "../output/peeling_trajectory_adaptive.csv"
+
+# Mesh sampling resolution
+NUM_Z_SLICES = 240          # Z-direction slices for cylindrical profile (increased for better curvature detection)
+NUM_THETA_SAMPLES = 360     # Angular samples (degrees)
+
+# ISO-scallop parameters (adaptive pitch mode)
+H_SCALLOP = 0.0003          # Target scallop height: 0.3mm
+PITCH_MIN = 0.001           # Minimum pitch: 1mm (high curvature regions)
+PITCH_MAX = 0.01            # Maximum pitch: 10mm (low curvature regions)
+
+# Fixed pitch parameters (non-adaptive mode)
+NUM_ROTATIONS = 15.0        # Number of full rotations during descent
+NUM_SAMPLES = 10000         # Trajectory resolution
+
+# Surface following
+SURFACE_OFFSET = 0.001     # Distance from surface: 0.1mm
+ENGAGEMENT_MARGIN = 0.001   # Blade engagement threshold: 1mm
+
+# Smoothing
+SPLINE_SMOOTHING = 0.0      # 0 = interpolation, >0 = smoothing
+CURVATURE_SMOOTHING_SIGMA = 1.5  # Gaussian filter sigma for curvature maps
+
+# Mode selection
+USE_ADAPTIVE = True         # True: ISO-scallop adaptive pitch, False: fixed pitch
+
+# Adaptive generation parameters
+ANGULAR_STEP = 0.01         # Angular increment (radians) ~0.57 degrees
+MAX_STEPS = 100000          # Safety limit for adaptive generation
+
+# Curvature computation parameters
+CURVATURE_WINDOW = 2        # Neighborhood size for local fitting (5×5 window)
+MIN_POINTS_FOR_FIT = 6      # Minimum points required for quadric fitting
+
+# Visualization parameters
+VIZ_MAX_POINTS = 5000       # Maximum points to show in visualization
+
+# ========================================
 
 
 # -------- Mesh Loading --------
-def load_mesh(mesh_path):
+def load_mesh(mesh_path: str) -> trimesh.Trimesh:
     """Load STL mesh and compute bounds"""
     mesh = trimesh.load(mesh_path)
     print(f"Mesh loaded: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
@@ -30,7 +71,11 @@ def load_mesh(mesh_path):
 
 
 # -------- Radial Profile Extraction --------
-def compute_cylindrical_profile(mesh, num_z_slices=120, num_theta_samples=360):
+def compute_cylindrical_profile(
+    mesh: trimesh.Trimesh,
+    num_z_slices: int = NUM_Z_SLICES,
+    num_theta_samples: int = NUM_THETA_SAMPLES
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Compute radial profile r(θ, z) in cylindrical coordinates
 
@@ -94,18 +139,304 @@ def compute_cylindrical_profile(mesh, num_z_slices=120, num_theta_samples=360):
     return z_array, theta_array, r_matrix
 
 
-# -------- Helical Trajectory Generation with Surface Following --------
-def generate_helical_curve(mesh, z_array, theta_array, r_matrix,
-                          num_rotations=2.0,
-                          surface_offset=0.0001,  # 0.1mm from surface
-                          num_samples=5000):
+# -------- Curvature Computation Helper Functions --------
+def compute_local_curvature(
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    z_grid: np.ndarray,
+    r_matrix: np.ndarray,
+    theta_array: np.ndarray,
+    i: int,
+    j: int,
+    window: int = CURVATURE_WINDOW
+) -> Tuple[float, float]:
     """
-    Generate helical single-curve trajectory following mesh surface
+    Compute principal curvatures at a single grid point using local quadric fitting
 
-    Uses actual mesh geometry to compute precise surface-following path:
-    - Ray casting to find closest surface point
-    - Normal-based offset for accurate surface tracking
-    - 0.1mm offset from mesh surface
+    Args:
+        x_grid, y_grid, z_grid: Cartesian coordinate grids
+        r_matrix: Radial distance matrix
+        theta_array: Angular positions
+        i, j: Grid indices
+        window: Neighborhood size
+
+    Returns:
+        kappa_radial: Curvature in radial direction
+        kappa_tangential: Curvature in tangential direction
+    """
+    N_z, N_theta = r_matrix.shape
+
+    # Extract local neighborhood (with boundary handling)
+    i_min = max(0, i - window)
+    i_max = min(N_z, i + window + 1)
+    j_min = j - window
+    j_max = j + window + 1
+
+    # Handle θ periodicity
+    j_indices = np.arange(j_min, j_max) % N_theta
+
+    # Local surface patch
+    x_local = x_grid[i_min:i_max, :][:, j_indices].flatten()
+    y_local = y_grid[i_min:i_max, :][:, j_indices].flatten()
+    z_local = z_grid[i_min:i_max, :][:, j_indices].flatten()
+
+    # Remove invalid points (r=0)
+    valid = r_matrix[i_min:i_max, :][:, j_indices].flatten() > 0
+    if np.sum(valid) < MIN_POINTS_FOR_FIT:
+        return 0.0, 0.0
+
+    x_local = x_local[valid]
+    y_local = y_local[valid]
+    z_local = z_local[valid]
+
+    # Fit quadric surface: z = a·x² + b·y² + c·xy + d·x + e·y + f
+    try:
+        A_fit = np.column_stack([
+            x_local**2,
+            y_local**2,
+            x_local * y_local,
+            x_local,
+            y_local,
+            np.ones_like(x_local)
+        ])
+
+        coeffs, _, _, _ = np.linalg.lstsq(A_fit, z_local, rcond=None)
+        a, b, c, _, _, _ = coeffs
+
+        # Compute curvatures at center point (x_ij, y_ij)
+        x_ij = x_grid[i, j]
+        y_ij = y_grid[i, j]
+        theta_ij = theta_array[j]
+
+        # Second derivatives (Hessian)
+        z_xx = 2*a
+        z_yy = 2*b
+        z_xy = c
+
+        # Radial and tangential directions
+        cos_t = np.cos(theta_ij)
+        sin_t = np.sin(theta_ij)
+
+        # Curvature in radial direction
+        kappa_radial = z_xx * cos_t**2 + 2*z_xy * cos_t*sin_t + z_yy * sin_t**2
+
+        # Curvature in tangential (θ) direction
+        kappa_tangential = z_xx * sin_t**2 - 2*z_xy * cos_t*sin_t + z_yy * cos_t**2
+
+        return abs(kappa_radial), abs(kappa_tangential)
+
+    except np.linalg.LinAlgError:
+        return 0.0, 0.0
+
+
+def compute_curvature_map(
+    r_matrix: np.ndarray,
+    z_array: np.ndarray,
+    theta_array: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute principal curvatures at each r(θ, z) grid point
+
+    Uses local quadric surface fitting on Cartesian coordinates (x, y, z)
+    to estimate κ₁, κ₂ (principal curvatures) at each surface point.
+
+    Args:
+        r_matrix: (N_z × N_theta) radial distances
+        z_array: Z heights
+        theta_array: Angular positions
+
+    Returns:
+        kappa_z: (N_z × N_theta) curvature in z-direction (for pitch adaptation)
+        kappa_theta: (N_z × N_theta) curvature in θ-direction (feed direction)
+    """
+    print(f"\nComputing curvature map on r(θ, z) grid...")
+
+    N_z, N_theta = r_matrix.shape
+    kappa_z = np.zeros_like(r_matrix)
+    kappa_theta = np.zeros_like(r_matrix)
+
+    # Convert r(θ, z) grid to Cartesian (x, y, z) surface points
+    theta_grid, z_grid = np.meshgrid(theta_array, z_array)
+    x_grid = r_matrix * np.cos(theta_grid)
+    y_grid = r_matrix * np.sin(theta_grid)
+
+    print(f"  Processing {N_z} × {N_theta} grid points...")
+
+    for i in range(N_z):
+        if i % 30 == 0:
+            print(f"    Row {i+1}/{N_z}")
+
+        for j in range(N_theta):
+            kappa_z[i, j], kappa_theta[i, j] = compute_local_curvature(
+                x_grid, y_grid, z_grid, r_matrix, theta_array, i, j
+            )
+
+    # Smooth curvature map to remove noise
+    kappa_z = gaussian_filter(kappa_z, sigma=CURVATURE_SMOOTHING_SIGMA)
+    kappa_theta = gaussian_filter(kappa_theta, sigma=CURVATURE_SMOOTHING_SIGMA)
+
+    print(f"  Curvature statistics:")
+    print(f"    κ_z (radial):  mean={np.mean(kappa_z):.3f}, max={np.max(kappa_z):.3f}")
+    print(f"    κ_θ (tangent): mean={np.mean(kappa_theta):.3f}, max={np.max(kappa_theta):.3f}")
+
+    return kappa_z, kappa_theta
+
+
+def compute_adaptive_pitch(
+    kappa: float,
+    h_scallop: float = H_SCALLOP,
+    pitch_min: float = PITCH_MIN,
+    pitch_max: float = PITCH_MAX
+) -> float:
+    """
+    Compute adaptive pitch based on ISO-scallop theory for flat tool
+
+    For a flat tool on curved surface:
+        h = κ · s² / 8
+
+    Solving for step-over s (= pitch in our helical case):
+        s = √(8h / κ)
+
+    Args:
+        kappa: Local curvature (1/m)
+        h_scallop: Target scallop height (m)
+        pitch_min: Minimum pitch (m)
+        pitch_max: Maximum pitch (m)
+
+    Returns:
+        pitch: Adaptive pitch value (m)
+    """
+    # Avoid division by zero
+    kappa_safe = max(kappa, 1e-6)
+
+    # ISO-scallop formula for flat tool
+    pitch = np.sqrt(8 * h_scallop / kappa_safe)
+
+    # Clamp to bounds
+    pitch = np.clip(pitch, pitch_min, pitch_max)
+
+    return pitch
+
+
+# -------- Surface Following Helper Functions --------
+def compute_radial_normals(closest_points: np.ndarray) -> np.ndarray:
+    """
+    Compute radial outward normals for surface points
+
+    Safe for convex-like shapes centered at origin.
+    Uses direction from origin to surface point.
+
+    Args:
+        closest_points: Nx3 array of surface points
+
+    Returns:
+        normals: Nx3 array of unit normal vectors (radial outward)
+    """
+    normals = np.zeros_like(closest_points)
+
+    for i in range(len(closest_points)):
+        # Direction from origin to surface point
+        radial_dir = closest_points[i] - np.array([0, 0, 0])
+        radial_norm = np.linalg.norm(radial_dir)
+
+        if radial_norm > 1e-6:
+            normals[i] = radial_dir / radial_norm
+        else:
+            # Fallback to Z-up if point is at origin
+            normals[i] = np.array([0, 0, 1])
+
+    return normals
+
+
+def compute_blade_engagement(
+    closest_points: np.ndarray,
+    r_max: float,
+    margin: float = ENGAGEMENT_MARGIN
+) -> np.ndarray:
+    """
+    Compute blade engagement states based on radial distance
+
+    Args:
+        closest_points: Nx3 array of surface points
+        r_max: Maximum radius (unpeeled reference)
+        margin: Engagement threshold (m)
+
+    Returns:
+        blade_states: N-length array of {0, 1} (0=retracted, 1=engaged)
+    """
+    r_surface = np.sqrt(closest_points[:, 0]**2 + closest_points[:, 1]**2)
+    is_unpeeled = r_surface < (r_max - margin)
+    return is_unpeeled.astype(int)
+
+
+def apply_surface_offset(
+    closest_points: np.ndarray,
+    normals: np.ndarray,
+    offset: float = SURFACE_OFFSET
+) -> np.ndarray:
+    """
+    Apply surface offset along normal direction
+
+    Args:
+        closest_points: Nx3 array of surface points
+        normals: Nx3 array of unit normals
+        offset: Offset distance (m)
+
+    Returns:
+        tcp_points: Nx3 array of offset points (TCP positions)
+    """
+    return closest_points + normals * offset
+
+
+def apply_surface_following(
+    mesh: trimesh.Trimesh,
+    positions: np.ndarray,
+    r_max: float,
+    surface_offset: float = SURFACE_OFFSET
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Apply surface-following logic: find nearest surface, compute offset and blade state
+
+    Args:
+        mesh: Trimesh object
+        positions: Nx3 array of query points
+        r_max: Maximum radius for blade engagement
+        surface_offset: Offset distance from surface (m)
+
+    Returns:
+        tcp_points: Nx3 array of TCP positions (offset from surface)
+        blade_states: N-length array of blade engagement {0, 1}
+    """
+    print(f"  Finding nearest surface points...")
+    closest_points, _, _ = mesh.nearest.on_surface(positions)
+
+    print(f"  Computing radial outward directions...")
+    normals = compute_radial_normals(closest_points)
+
+    print(f"  Computing blade engagement...")
+    blade_states = compute_blade_engagement(closest_points, r_max)
+
+    print(f"  Applying surface offset...")
+    tcp_points = apply_surface_offset(closest_points, normals, surface_offset)
+
+    engagement_ratio = np.sum(blade_states) / len(blade_states) * 100
+    print(f"  Blade engagement: {engagement_ratio:.1f}%")
+
+    return tcp_points, blade_states
+
+
+# -------- Helical Trajectory Generation (Fixed Pitch) --------
+def generate_helical_curve(
+    mesh: trimesh.Trimesh,
+    z_array: np.ndarray,
+    theta_array: np.ndarray,
+    r_matrix: np.ndarray,
+    num_rotations: float = NUM_ROTATIONS,
+    surface_offset: float = SURFACE_OFFSET,
+    num_samples: int = NUM_SAMPLES
+) -> Tuple[np.ndarray, float]:
+    """
+    Generate helical single-curve trajectory following mesh surface (fixed pitch)
 
     Args:
         mesh: trimesh object
@@ -113,11 +444,12 @@ def generate_helical_curve(mesh, z_array, theta_array, r_matrix,
         theta_array: Angular samples
         r_matrix: Radial profile (for initial guess)
         num_rotations: Number of full rotations during descent
-        surface_offset: Distance from surface (m, default 0.1mm)
+        surface_offset: Distance from surface (m)
         num_samples: Number of trajectory points
 
     Returns:
         trajectory: Nx4 array [x, y, z, blade_engaged]
+        r_max: Maximum radius
     """
     print(f"\nGenerating helical surface-following trajectory:")
     print(f"  Number of rotations: {num_rotations}")
@@ -149,13 +481,10 @@ def generate_helical_curve(mesh, z_array, theta_array, r_matrix,
     # Wrap theta to [0, 2π) for r_matrix lookup
     theta_wrapped = theta_traj % (2 * np.pi)
 
-    # Generate trajectory with surface following
-    trajectory = np.zeros((num_samples, 4))
+    # Generate initial query points
+    print(f"  Generating query points...")
+    query_points = np.zeros((num_samples, 3))
 
-    print(f"  Computing surface-following path...")
-
-    # Batch process for speed
-    query_points = []
     for i in range(num_samples):
         z = z_traj[i]
         theta = theta_wrapped[i]
@@ -164,72 +493,151 @@ def generate_helical_curve(mesh, z_array, theta_array, r_matrix,
         r_guess = float(r_interp_func(z, theta))
 
         # Query point at initial guess
-        x_guess = r_guess * np.cos(theta_traj[i])
-        y_guess = r_guess * np.sin(theta_traj[i])
-        query_points.append([x_guess, y_guess, z])
+        query_points[i] = [
+            r_guess * np.cos(theta_traj[i]),
+            r_guess * np.sin(theta_traj[i]),
+            z
+        ]
 
-    query_points = np.array(query_points)
+    # Apply surface following
+    print(f"  Computing surface-following path...")
+    tcp_points, blade_states = apply_surface_following(mesh, query_points, r_max, surface_offset)
 
-    # Batch query nearest surface points
-    print(f"  Finding nearest surface points...")
-    closest_points, distances, face_ids = mesh.nearest.on_surface(query_points)
+    # Combine into trajectory
+    trajectory = np.column_stack([tcp_points, blade_states])
 
-    # Get surface normals
-    normals = mesh.face_normals[face_ids]
+    return trajectory, r_max
 
-    # Compute blade engagement
-    engagement_margin = 0.001  # 1mm
-    retract_distance = 0.01    # 10mm
 
-    print(f"  Applying surface offset and blade logic...")
-    for i in range(num_samples):
-        if i % 1000 == 0:
-            print(f"    Sample {i}/{num_samples}")
+# -------- Adaptive Helical Trajectory Generation --------
+def generate_adaptive_helical_curve(
+    mesh: trimesh.Trimesh,
+    z_array: np.ndarray,
+    theta_array: np.ndarray,
+    r_matrix: np.ndarray,
+    kappa_z: np.ndarray,
+    kappa_theta: np.ndarray,
+    h_scallop: float = H_SCALLOP,
+    pitch_min: float = PITCH_MIN,
+    pitch_max: float = PITCH_MAX,
+    surface_offset: float = SURFACE_OFFSET
+) -> Tuple[np.ndarray, float]:
+    """
+    Generate helical trajectory with ISO-scallop adaptive pitch
 
-        # Check if this is an unpeeled region
-        r_surface = np.sqrt(closest_points[i, 0]**2 + closest_points[i, 1]**2)
-        is_unpeeled = r_surface < (r_max - engagement_margin)
+    Pitch adapts based on local curvature:
+    - High curvature → small pitch (dense sampling)
+    - Low curvature → large pitch (efficient coverage)
 
-        if is_unpeeled:
-            # Blade engaged: follow surface with precise offset
-            # Move along surface normal
-            tcp_point = closest_points[i] + normals[i] * surface_offset
-            blade_engaged = 1
-        else:
-            # Blade retracted: move away from max radius zone
-            theta = theta_traj[i]
-            r_retract = r_max + retract_distance
-            tcp_point = np.array([
-                r_retract * np.cos(theta),
-                r_retract * np.sin(theta),
-                z_traj[i]
-            ])
-            blade_engaged = 0
+    Args:
+        mesh: trimesh object
+        z_array: Z heights
+        theta_array: Angular samples
+        r_matrix: Radial profile
+        kappa_z: Curvature map in z-direction (N_z × N_theta)
+        kappa_theta: Curvature map in θ-direction
+        h_scallop: Target scallop height (m)
+        pitch_min: Minimum pitch (m)
+        pitch_max: Maximum pitch (m)
+        surface_offset: Distance from surface (m)
 
-        trajectory[i] = [tcp_point[0], tcp_point[1], tcp_point[2], blade_engaged]
+    Returns:
+        trajectory: Nx4 array [x, y, z, blade_engaged]
+        r_max: Maximum radius
+    """
+    print(f"\nGenerating adaptive helical trajectory (ISO-scallop):")
+    print(f"  Target scallop height: {h_scallop*1000:.2f}mm")
+    print(f"  Pitch range: [{pitch_min*1000:.1f}, {pitch_max*1000:.1f}]mm")
+    print(f"  Surface offset: {surface_offset*1000:.2f}mm")
 
-    engagement_ratio = np.sum(trajectory[:, 3]) / num_samples * 100
-    print(f"  Blade engagement: {engagement_ratio:.1f}%")
+    # Create interpolators
+    r_interp = RectBivariateSpline(z_array, theta_array, r_matrix, kx=1, ky=1)
+    kappa_interp = RectBivariateSpline(z_array, theta_array, kappa_z, kx=1, ky=1)
 
-    # Debug info
-    engaged_points = trajectory[trajectory[:, 3] == 1, :3]
-    if len(engaged_points) > 0:
-        # Check actual distance from surface for engaged points
-        actual_distances = np.linalg.norm(engaged_points - closest_points[trajectory[:, 3] == 1], axis=1)
-        print(f"\n  Debug - Surface offset accuracy (engaged points):")
-        print(f"    Target offset: {surface_offset*1000:.2f}mm")
-        print(f"    Mean actual offset: {np.mean(actual_distances)*1000:.2f}mm")
-        print(f"    Min offset: {np.min(actual_distances)*1000:.2f}mm")
-        print(f"    Max offset: {np.max(actual_distances)*1000:.2f}mm")
+    # Global max radius
+    r_max = np.max(r_matrix)
+    print(f"  Global max radius: {r_max:.4f}m")
+
+    # Start from top
+    z_start = z_array[-1]
+    z_end = z_array[0]
+    theta = 0.0
+
+    # Generate trajectory adaptively
+    trajectory_list = []
+    z = z_start
+
+    print(f"  Generating adaptive path from Z={z_start:.4f}m to Z={z_end:.4f}m...")
+
+    step_count = 0
+    pitches = []
+
+    while z > z_end and step_count < MAX_STEPS:
+        step_count += 1
+
+        # Get current curvature
+        theta_wrapped = theta % (2 * np.pi)
+        kappa_current = float(kappa_interp(z, theta_wrapped)[0, 0])
+
+        # Compute adaptive pitch
+        pitch = compute_adaptive_pitch(kappa_current, h_scallop, pitch_min, pitch_max)
+        pitches.append(pitch)
+
+        # Get radius at current position
+        r_current = float(r_interp(z, theta_wrapped)[0, 0])
+
+        # Convert to Cartesian
+        x = r_current * np.cos(theta)
+        y = r_current * np.sin(theta)
+
+        # Store point
+        trajectory_list.append([x, y, z])
+
+        # Advance: small angular increment, descend by pitch
+        theta += ANGULAR_STEP
+        z -= pitch * ANGULAR_STEP / (2 * np.pi)  # Pitch per revolution
+
+        if step_count % 5000 == 0:
+            print(f"    Step {step_count}: Z={z:.4f}m, θ={theta/(2*np.pi):.2f} rev, pitch={pitch*1000:.2f}mm")
+
+    print(f"  Generated {step_count} points, {theta/(2*np.pi):.2f} rotations")
+
+    # Convert to numpy array
+    positions = np.array(trajectory_list)
+
+    # Apply surface following
+    print(f"  Computing surface-following path...")
+    tcp_points, blade_states = apply_surface_following(mesh, positions, r_max, surface_offset)
+
+    # Combine into trajectory
+    trajectory = np.column_stack([tcp_points, blade_states])
+
+    # Statistics on adaptive pitch
+    pitches = np.array(pitches)
+    print(f"\n  Adaptive pitch statistics:")
+    print(f"    Mean: {np.mean(pitches)*1000:.2f}mm")
+    print(f"    Min:  {np.min(pitches)*1000:.2f}mm")
+    print(f"    Max:  {np.max(pitches)*1000:.2f}mm")
+    print(f"    Std:  {np.std(pitches)*1000:.2f}mm")
 
     return trajectory, r_max
 
 
 # -------- Spline Smoothing --------
-def smooth_curve_with_spline(trajectory, smoothing_factor=0.0):
+def smooth_curve_with_spline(
+    trajectory: np.ndarray,
+    smoothing_factor: float = SPLINE_SMOOTHING
+) -> np.ndarray:
     """
     Smooth trajectory with B-spline for natural curve
     Preserve blade state as discrete
+
+    Args:
+        trajectory: Nx4 array [x, y, z, blade_engaged]
+        smoothing_factor: Spline smoothing parameter (0=interpolation)
+
+    Returns:
+        smooth_traj: Nx4 array (smoothed)
     """
     print(f"\nSmoothing curve with B-spline...")
 
@@ -260,9 +668,18 @@ def smooth_curve_with_spline(trajectory, smoothing_factor=0.0):
 
 
 # -------- Visualization --------
-def visualize_trajectory(mesh, trajectory, r_max):
+def visualize_trajectory(
+    mesh: trimesh.Trimesh,
+    trajectory: np.ndarray,
+    r_max: float
+) -> None:
     """
     Visualize mesh and helical trajectory with Open3D
+
+    Args:
+        mesh: Trimesh object
+        trajectory: Nx4 array [x, y, z, blade_engaged]
+        r_max: Maximum radius
     """
     # Mesh (semi-transparent to see path better)
     mesh_o3d = o3d.geometry.TriangleMesh()
@@ -275,8 +692,8 @@ def visualize_trajectory(mesh, trajectory, r_max):
     path_points = trajectory[:, :3]
     blade_states = trajectory[:, 3]
 
-    # Downsample for visualization (show more points for detail)
-    step = max(1, len(path_points) // 5000)
+    # Downsample for visualization
+    step = max(1, len(path_points) // VIZ_MAX_POINTS)
     viz_points = path_points[::step]
     viz_states = blade_states[::step]
 
@@ -304,41 +721,27 @@ def visualize_trajectory(mesh, trajectory, r_max):
     # Coordinate frame
     coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.04)
 
-    # Start/End markers
-    start_marker = o3d.geometry.TriangleMesh.create_sphere(radius=0.008)
-    start_marker.translate(path_points[0])
-    start_marker.paint_uniform_color([0.2, 0.4, 1.0])  # Blue
-
-    end_marker = o3d.geometry.TriangleMesh.create_sphere(radius=0.008)
-    end_marker.translate(path_points[-1])
-    end_marker.paint_uniform_color([1.0, 0.2, 0.2])  # Red
-
-    # Max radius cylinder (for reference)
-    cylinder = o3d.geometry.TriangleMesh.create_cylinder(
-        radius=r_max, height=mesh.bounds[1][2] - mesh.bounds[0][2]
-    )
-    cylinder.translate([0, 0, mesh.bounds[0][2]])
-    cylinder.paint_uniform_color([0.3, 0.3, 0.8])
-    cylinder_wireframe = o3d.geometry.LineSet.create_from_triangle_mesh(cylinder)
-    cylinder_wireframe.paint_uniform_color([0.5, 0.5, 0.9])
-
     print("\n=== Open3D Visualization ===")
-    print("Green curve: Blade engaged (cutting unpeeled regions)")
-    print("Orange curve: Blade retracted (avoiding max radius)")
-    print("Blue wireframe cylinder: Global max radius reference")
-    print("Blue sphere: Start (top)")
-    print("Red sphere: End (bottom)")
+    print("Green curve: Blade engaged (unpeeled regions)")
+    print("Orange curve: Already peeled regions (max radius)")
+    print("\nNote: Path is continuous (no retraction jumps)")
 
     o3d.visualization.draw_geometries(
-        [mesh_o3d, line_set, coord_frame, start_marker, end_marker, cylinder_wireframe],
+        [mesh_o3d, line_set, coord_frame],
         window_name="Helical Potato Peeling Trajectory",
         width=1600, height=1000
     )
 
 
 # -------- Export --------
-def export_trajectory(trajectory, output_path):
-    """Export trajectory: x, y, z, blade_engaged"""
+def export_trajectory(trajectory: np.ndarray, output_path: str) -> None:
+    """
+    Export trajectory to CSV file
+
+    Args:
+        trajectory: Nx4 array [x, y, z, blade_engaged]
+        output_path: Output file path
+    """
     np.savetxt(output_path, trajectory, delimiter=',',
                header='x,y,z,blade_engaged', comments='',
                fmt='%.6f,%.6f,%.6f,%d')
@@ -348,47 +751,51 @@ def export_trajectory(trajectory, output_path):
 
 # -------- Main Pipeline --------
 def main():
-    # -------- Configuration --------
-    MESH_PATH = "mesh/mesh_1_processed.stl"
-    OUTPUT_PATH = "output/peeling_trajectory.csv"
-
-    # Mesh sampling resolution
-    NUM_Z_SLICES = 120
-    NUM_THETA_SAMPLES = 360
-
-    # Helix parameters
-    NUM_ROTATIONS = 15.0     # Number of full rotations during descent (more = tighter spacing)
-    NUM_SAMPLES = 10000      # Trajectory resolution
-    SURFACE_OFFSET = 0.0001  # 0.1mm offset from surface
-
-    # Smoothing
-    SPLINE_SMOOTHING = 0.0   # 0 = interpolation, >0 = smoothing
-
+    """Main trajectory generation pipeline"""
     print("=" * 70)
     print("Helical Potato Peeling Trajectory Generator")
+    print("Mode: " + ("ADAPTIVE (ISO-scallop)" if USE_ADAPTIVE else "FIXED PITCH"))
     print("=" * 70)
 
     # Step 1: Load mesh
-    print("\n[1/4] Loading mesh...")
+    print("\n[1/5] Loading mesh...")
     mesh = load_mesh(MESH_PATH)
 
     # Step 2: Compute cylindrical profile
-    print("\n[2/4] Computing cylindrical surface profile...")
+    print("\n[2/5] Computing cylindrical surface profile...")
     z_array, theta_array, r_matrix = compute_cylindrical_profile(
         mesh, NUM_Z_SLICES, NUM_THETA_SAMPLES
     )
 
-    # Step 3: Generate helical curve
-    print("\n[3/4] Generating helical trajectory...")
-    trajectory, r_max = generate_helical_curve(
-        mesh, z_array, theta_array, r_matrix,
-        num_rotations=NUM_ROTATIONS,
-        surface_offset=SURFACE_OFFSET,
-        num_samples=NUM_SAMPLES
-    )
+    # Step 3: Compute curvature map (for adaptive mode)
+    if USE_ADAPTIVE:
+        print("\n[3/5] Computing curvature map...")
+        kappa_z, kappa_theta = compute_curvature_map(r_matrix, z_array, theta_array)
+    else:
+        kappa_z, kappa_theta = None, None
+        print("\n[3/5] Skipping curvature computation (fixed pitch mode)")
 
-    # Step 4: Smooth curve
-    print("\n[4/4] Smoothing curve...")
+    # Step 4: Generate helical curve
+    print("\n[4/5] Generating helical trajectory...")
+    if USE_ADAPTIVE:
+        trajectory, r_max = generate_adaptive_helical_curve(
+            mesh, z_array, theta_array, r_matrix,
+            kappa_z, kappa_theta,
+            h_scallop=H_SCALLOP,
+            pitch_min=PITCH_MIN,
+            pitch_max=PITCH_MAX,
+            surface_offset=SURFACE_OFFSET
+        )
+    else:
+        trajectory, r_max = generate_helical_curve(
+            mesh, z_array, theta_array, r_matrix,
+            num_rotations=NUM_ROTATIONS,
+            surface_offset=SURFACE_OFFSET,
+            num_samples=NUM_SAMPLES
+        )
+
+    # Step 5: Smooth curve
+    print("\n[5/5] Smoothing curve...")
     smooth_traj = smooth_curve_with_spline(trajectory, SPLINE_SMOOTHING)
 
     # Export
