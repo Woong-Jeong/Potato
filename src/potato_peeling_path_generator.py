@@ -19,58 +19,79 @@ from scipy.ndimage import gaussian_filter
 # CONFIGURATION PARAMETERS
 # ========================================
 
-# File paths
+# -------- File I/O --------
 MESH_PATH = "../mesh/mesh_1_processed.stl"
 OUTPUT_PATH = "../output/peeling_trajectory_adaptive.csv"
 
-# Mesh sampling resolution
-NUM_Z_SLICES = 240          # Z-direction slices for cylindrical profile (increased for better curvature detection)
-NUM_THETA_SAMPLES = 360     # Angular samples (degrees)
+# -------- Mesh Sampling Resolution --------
+NUM_Z_SLICES = 240          # Z-direction slices for cylindrical profile
+NUM_THETA_SAMPLES = 360     # Angular samples (1 degree resolution)
 
-# ISO-scallop parameters (adaptive pitch mode)
-H_SCALLOP = 0.0003          # Target scallop height: 0.3mm
+# -------- ISO-scallop Adaptive Pitch Parameters --------
+H_SCALLOP = 0.003           # Target scallop height: 3mm (surface quality)
 PITCH_MIN = 0.001           # Minimum pitch: 1mm (high curvature regions)
-PITCH_MAX = 0.01            # Maximum pitch: 10mm (low curvature regions)
+PITCH_MAX = 0.027           # Maximum pitch: 27mm (low curvature regions)
+                            # NOTE: Independent of tool size in ISO-scallop theory
 
-# Fixed pitch parameters (non-adaptive mode)
+# -------- Fixed Pitch Parameters (Non-Adaptive Mode) --------
 NUM_ROTATIONS = 15.0        # Number of full rotations during descent
-NUM_SAMPLES = 10000         # Trajectory resolution
+NUM_SAMPLES = 10000         # Trajectory resolution for fixed pitch mode
 
-# Surface following
-SURFACE_OFFSET = 0.001     # Distance from surface: 0.1mm
+# -------- Surface Following --------
+SURFACE_OFFSET = 0.001      # TCP offset from surface: 0.1mm
 ENGAGEMENT_MARGIN = 0.001   # Blade engagement threshold: 1mm
 
-# Smoothing
-SPLINE_SMOOTHING = 0.0      # 0 = interpolation, >0 = smoothing
-CURVATURE_SMOOTHING_SIGMA = 1.5  # Gaussian filter sigma for curvature maps
+# -------- Smoothing --------
+SPLINE_SMOOTHING = 1.0              # B-spline smoothing (0=interpolation, >0=smoothing)
+CURVATURE_SMOOTHING_SIGMA = 1.5     # Gaussian filter sigma for curvature noise reduction
 
-# Mode selection
+# -------- Mode Selection --------
 USE_ADAPTIVE = True         # True: ISO-scallop adaptive pitch, False: fixed pitch
 
-# Adaptive generation parameters
-ANGULAR_STEP = 0.01         # Angular increment (radians) ~0.57 degrees
-MAX_STEPS = 100000          # Safety limit for adaptive generation
+# -------- Adaptive Generation --------
+ANGULAR_STEP = 0.01         # Angular increment per step (radians) ≈ 0.57°
+MAX_STEPS = 100000          # Safety limit to prevent infinite loops
 
-# Curvature computation parameters
-CURVATURE_WINDOW = 2        # Neighborhood size for local fitting (5×5 window)
-MIN_POINTS_FOR_FIT = 6      # Minimum points required for quadric fitting
+# -------- Curvature Computation --------
+CURVATURE_WINDOW = 2        # Neighborhood radius for quadric fitting (5×5 window)
+MIN_POINTS_FOR_FIT = 6      # Minimum valid points required for stable fitting
 
-# Visualization parameters
-VIZ_MAX_POINTS = 5000       # Maximum points to show in visualization
+# -------- Visualization --------
+VIZ_MAX_POINTS = 5000       # Downsample trajectory for visualization performance
 
+# -------- Debug Output --------
+DEBUG_CURVATURE = True      # Show detailed curvature-pitch calculations
+DEBUG_FIRST_N_STEPS = 10    # Number of initial steps to show in detail
+DEBUG_STEP_INTERVAL = 1000  # Show progress every N steps
+
+# ========================================
+# CORE FUNCTIONS
 # ========================================
 
 
-# -------- Mesh Loading --------
+# ========================================
+# 1. MESH I/O AND PREPROCESSING
+# ========================================
+
 def load_mesh(mesh_path: str) -> trimesh.Trimesh:
-    """Load STL mesh and compute bounds"""
+    """
+    Load STL mesh file and display basic information
+
+    Args:
+        mesh_path: Path to STL file
+
+    Returns:
+        mesh: Loaded trimesh object with computed bounds
+    """
     mesh = trimesh.load(mesh_path)
     print(f"Mesh loaded: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
     print(f"Z bounds: [{mesh.bounds[0][2]:.4f}, {mesh.bounds[1][2]:.4f}]m")
     return mesh
 
 
-# -------- Radial Profile Extraction --------
+# ========================================
+# 2. CYLINDRICAL PROFILE EXTRACTION
+# ========================================
 def compute_cylindrical_profile(
     mesh: trimesh.Trimesh,
     num_z_slices: int = NUM_Z_SLICES,
@@ -139,7 +160,10 @@ def compute_cylindrical_profile(
     return z_array, theta_array, r_matrix
 
 
-# -------- Curvature Computation Helper Functions --------
+# ========================================
+# 3. CURVATURE COMPUTATION
+# ========================================
+
 def compute_local_curvature(
     x_grid: np.ndarray,
     y_grid: np.ndarray,
@@ -151,18 +175,28 @@ def compute_local_curvature(
     window: int = CURVATURE_WINDOW
 ) -> Tuple[float, float]:
     """
-    Compute principal curvatures at a single grid point using local quadric fitting
+    Compute directional curvatures at a grid point using quadric surface fitting
+
+    Method:
+        1. Extract local (2*window+1) × (2*window+1) neighborhood
+        2. Fit quadric surface: z = ax² + by² + cxy + dx + ey + f
+        3. Compute Hessian matrix from second derivatives
+        4. Project along radial and tangential directions
+        5. Apply gradient correction: κ_exact = κ_approx / (1 + |∇z|²)^(3/2)
 
     Args:
-        x_grid, y_grid, z_grid: Cartesian coordinate grids
-        r_matrix: Radial distance matrix
-        theta_array: Angular positions
-        i, j: Grid indices
-        window: Neighborhood size
+        x_grid, y_grid, z_grid: Cartesian coordinate grids (N_z × N_θ)
+        r_matrix: Radial distance matrix (N_z × N_θ)
+        theta_array: Angular positions [0, 2π)
+        i, j: Grid indices (i=z_index, j=theta_index)
+        window: Neighborhood radius (default: 2 → 5×5 window)
 
     Returns:
-        kappa_radial: Curvature in radial direction
-        kappa_tangential: Curvature in tangential direction
+        kappa_radial: Curvature in radial direction [1/m]
+        kappa_tangential: Curvature in tangential direction [1/m]
+
+    Note:
+        Returns (0.0, 0.0) if insufficient valid points or fitting fails
     """
     N_z, N_theta = r_matrix.shape
 
@@ -201,12 +235,16 @@ def compute_local_curvature(
         ])
 
         coeffs, _, _, _ = np.linalg.lstsq(A_fit, z_local, rcond=None)
-        a, b, c, _, _, _ = coeffs
+        a, b, c, d, e, f = coeffs
 
         # Compute curvatures at center point (x_ij, y_ij)
         x_ij = x_grid[i, j]
         y_ij = y_grid[i, j]
         theta_ij = theta_array[j]
+
+        # First derivatives (gradient) at center point (x_ij, y_ij)
+        z_x = 2*a*x_ij + c*y_ij + d  # ∂z/∂x at (x_ij, y_ij)
+        z_y = 2*b*y_ij + c*x_ij + e  # ∂z/∂y at (x_ij, y_ij)
 
         # Second derivatives (Hessian)
         z_xx = 2*a
@@ -217,11 +255,22 @@ def compute_local_curvature(
         cos_t = np.cos(theta_ij)
         sin_t = np.sin(theta_ij)
 
-        # Curvature in radial direction
+        # Curvature in radial direction (before correction)
         kappa_radial = z_xx * cos_t**2 + 2*z_xy * cos_t*sin_t + z_yy * sin_t**2
 
-        # Curvature in tangential (θ) direction
+        # Curvature in tangential (θ) direction (before correction)
         kappa_tangential = z_xx * sin_t**2 - 2*z_xy * cos_t*sin_t + z_yy * cos_t**2
+
+        # Apply exact curvature formula with gradient correction
+        # κ_exact = |∂²z/∂n²| / (1 + |∇z|²)^(3/2)
+        grad_magnitude_sq = z_x**2 + z_y**2
+        denominator = (1 + grad_magnitude_sq) ** 1.5
+
+        if denominator < 1e-10:
+            return 0.0, 0.0
+
+        kappa_radial /= denominator
+        kappa_tangential /= denominator
 
         return abs(kappa_radial), abs(kappa_tangential)
 
@@ -235,19 +284,27 @@ def compute_curvature_map(
     theta_array: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Compute principal curvatures at each r(θ, z) grid point
+    Compute directional curvature maps across entire cylindrical grid
 
-    Uses local quadric surface fitting on Cartesian coordinates (x, y, z)
-    to estimate κ₁, κ₂ (principal curvatures) at each surface point.
+    Process:
+        1. Convert r(θ, z) cylindrical grid to Cartesian (x, y, z)
+        2. For each grid point, compute local curvatures via quadric fitting
+        3. Apply Gaussian smoothing to reduce noise (σ=1.5)
+        4. Display statistics and expected pitch range (debug mode)
 
     Args:
-        r_matrix: (N_z × N_theta) radial distances
-        z_array: Z heights
-        theta_array: Angular positions
+        r_matrix: (N_z × N_θ) radial distance grid [m]
+        z_array: Z height array [m]
+        theta_array: Angular position array [rad]
 
     Returns:
-        kappa_z: (N_z × N_theta) curvature in z-direction (for pitch adaptation)
-        kappa_theta: (N_z × N_theta) curvature in θ-direction (feed direction)
+        kappa_z: (N_z × N_θ) curvature in radial direction [1/m]
+        kappa_theta: (N_z × N_θ) curvature in tangential direction [1/m]
+
+    Note:
+        - Processing time: ~10-30s for 240×360 grid
+        - kappa_z is used for adaptive pitch calculation
+        - Gaussian smoothing prevents pitch oscillations from noise
     """
     print(f"\nComputing curvature map on r(θ, z) grid...")
 
@@ -276,8 +333,20 @@ def compute_curvature_map(
     kappa_theta = gaussian_filter(kappa_theta, sigma=CURVATURE_SMOOTHING_SIGMA)
 
     print(f"  Curvature statistics:")
-    print(f"    κ_z (radial):  mean={np.mean(kappa_z):.3f}, max={np.max(kappa_z):.3f}")
-    print(f"    κ_θ (tangent): mean={np.mean(kappa_theta):.3f}, max={np.max(kappa_theta):.3f}")
+    print(f"    κ_z (radial):  mean={np.mean(kappa_z):.3f}, max={np.max(kappa_z):.3f}, min={np.min(kappa_z):.3f}")
+    print(f"    κ_θ (tangent): mean={np.mean(kappa_theta):.3f}, max={np.max(kappa_theta):.3f}, min={np.min(kappa_theta):.3f}")
+
+    # Show what pitch would result from these curvatures (debug mode)
+    if DEBUG_CURVATURE:
+        print(f"\n  Expected pitch range (from curvature map):")
+        pitch_from_min = np.sqrt(8 * H_SCALLOP / max(np.max(kappa_z), 1e-6))
+        pitch_from_max = np.sqrt(8 * H_SCALLOP / max(np.min(kappa_z[kappa_z > 0]), 1e-6))
+        pitch_from_mean = np.sqrt(8 * H_SCALLOP / max(np.mean(kappa_z), 1e-6))
+        print(f"    Max κ ({np.max(kappa_z):.3f} 1/m) → pitch_theory = {pitch_from_min*1000:.2f}mm")
+        print(f"    Mean κ ({np.mean(kappa_z):.3f} 1/m) → pitch_theory = {pitch_from_mean*1000:.2f}mm")
+        print(f"    Min κ ({np.min(kappa_z[kappa_z > 0]) if np.any(kappa_z > 0) else 0:.3f} 1/m) → pitch_theory = {pitch_from_max*1000:.2f}mm")
+        print(f"    PITCH_MAX limit: {PITCH_MAX*1000:.2f}mm")
+        print(f"    → Clamping expected for κ < {(8*H_SCALLOP/PITCH_MAX**2):.3f} 1/m")
 
     return kappa_z, kappa_theta
 
@@ -318,7 +387,10 @@ def compute_adaptive_pitch(
     return pitch
 
 
-# -------- Surface Following Helper Functions --------
+# ========================================
+# 4. SURFACE FOLLOWING
+# ========================================
+
 def compute_radial_normals(closest_points: np.ndarray) -> np.ndarray:
     """
     Compute radial outward normals for surface points
@@ -425,7 +497,12 @@ def apply_surface_following(
     return tcp_points, blade_states
 
 
-# -------- Helical Trajectory Generation (Fixed Pitch) --------
+# ========================================
+# 5. PATH GENERATION
+# ========================================
+
+# -------- 5.1 Fixed Pitch Mode --------
+
 def generate_helical_curve(
     mesh: trimesh.Trimesh,
     z_array: np.ndarray,
@@ -509,7 +586,8 @@ def generate_helical_curve(
     return trajectory, r_max
 
 
-# -------- Adaptive Helical Trajectory Generation --------
+# -------- 5.2 Adaptive Pitch Mode (ISO-scallop) --------
+
 def generate_adaptive_helical_curve(
     mesh: trimesh.Trimesh,
     z_array: np.ndarray,
@@ -523,27 +601,45 @@ def generate_adaptive_helical_curve(
     surface_offset: float = SURFACE_OFFSET
 ) -> Tuple[np.ndarray, float]:
     """
-    Generate helical trajectory with ISO-scallop adaptive pitch
+    Generate helical trajectory with ISO-scallop curvature-adaptive pitch
 
-    Pitch adapts based on local curvature:
-    - High curvature → small pitch (dense sampling)
-    - Low curvature → large pitch (efficient coverage)
+    Algorithm:
+        1. Start from top (z_max), θ=0
+        2. At each step:
+           a. Interpolate local curvature κ from curvature map
+           b. Calculate adaptive pitch: s = √(8h/κ)
+           c. Clamp pitch to [PITCH_MIN, PITCH_MAX]
+           d. Advance: θ += Δθ, z -= s·Δθ/(2π)
+        3. Continue until reaching bottom (z_min)
+        4. Apply surface following to entire path
+
+    Pitch behavior:
+        - High curvature (sharp features) → small pitch → dense sampling
+        - Low curvature (flat regions) → large pitch → efficient coverage
+        - Ensures constant surface quality (scallop height) across varying geometry
 
     Args:
-        mesh: trimesh object
-        z_array: Z heights
-        theta_array: Angular samples
-        r_matrix: Radial profile
-        kappa_z: Curvature map in z-direction (N_z × N_theta)
-        kappa_theta: Curvature map in θ-direction
-        h_scallop: Target scallop height (m)
-        pitch_min: Minimum pitch (m)
-        pitch_max: Maximum pitch (m)
-        surface_offset: Distance from surface (m)
+        mesh: Trimesh object for surface queries
+        z_array: Z height array [m]
+        theta_array: Angular position array [rad]
+        r_matrix: (N_z × N_θ) radial profile [m]
+        kappa_z: (N_z × N_θ) curvature map in radial direction [1/m]
+        kappa_theta: (N_z × N_θ) curvature map in tangential direction [1/m]
+        h_scallop: Target scallop height [m] (default: 3mm)
+        pitch_min: Minimum pitch [m] (default: 1mm)
+        pitch_max: Maximum pitch [m] (default: 27mm)
+        surface_offset: TCP offset from surface [m] (default: 0.1mm)
 
     Returns:
-        trajectory: Nx4 array [x, y, z, blade_engaged]
-        r_max: Maximum radius
+        trajectory: (N × 4) array [x, y, z, blade_engaged]
+        r_max: Maximum radius for blade engagement detection [m]
+
+    Debug Output:
+        If DEBUG_CURVATURE=True, prints:
+        - First N steps: κ → pitch_theory → pitch [clamp status]
+        - Progress every N steps
+        - Final statistics: pitch distribution, clamping ratios
+        - Curvature-pitch correlation analysis
     """
     print(f"\nGenerating adaptive helical trajectory (ISO-scallop):")
     print(f"  Target scallop height: {h_scallop*1000:.2f}mm")
@@ -571,6 +667,12 @@ def generate_adaptive_helical_curve(
 
     step_count = 0
     pitches = []
+    curvatures = []
+    pitch_max_count = 0
+    pitch_min_count = 0
+
+    if DEBUG_CURVATURE:
+        print(f"\n  DEBUG: First {DEBUG_FIRST_N_STEPS} steps (curvature → pitch calculation):")
 
     while z > z_end and step_count < MAX_STEPS:
         step_count += 1
@@ -578,10 +680,28 @@ def generate_adaptive_helical_curve(
         # Get current curvature
         theta_wrapped = theta % (2 * np.pi)
         kappa_current = float(kappa_interp(z, theta_wrapped)[0, 0])
+        curvatures.append(kappa_current)
 
         # Compute adaptive pitch
         pitch = compute_adaptive_pitch(kappa_current, h_scallop, pitch_min, pitch_max)
         pitches.append(pitch)
+
+        # Debug output for first N steps
+        if DEBUG_CURVATURE and step_count <= DEBUG_FIRST_N_STEPS:
+            kappa_safe = max(kappa_current, 1e-6)
+            pitch_theory = np.sqrt(8 * h_scallop / kappa_safe)
+            clamped_status = ""
+            if pitch >= pitch_max:
+                clamped_status = " [MAX]"
+            elif pitch <= pitch_min:
+                clamped_status = " [MIN]"
+            print(f"    Step {step_count}: κ={kappa_current:.4f} 1/m → pitch_theory={pitch_theory*1000:.2f}mm → pitch={pitch*1000:.2f}mm{clamped_status}")
+
+        # Count clamping events
+        if pitch >= pitch_max:
+            pitch_max_count += 1
+        elif pitch <= pitch_min:
+            pitch_min_count += 1
 
         # Get radius at current position
         r_current = float(r_interp(z, theta_wrapped)[0, 0])
@@ -597,10 +717,12 @@ def generate_adaptive_helical_curve(
         theta += ANGULAR_STEP
         z -= pitch * ANGULAR_STEP / (2 * np.pi)  # Pitch per revolution
 
-        if step_count % 5000 == 0:
-            print(f"    Step {step_count}: Z={z:.4f}m, θ={theta/(2*np.pi):.2f} rev, pitch={pitch*1000:.2f}mm")
+        # Debug output every N steps
+        if DEBUG_CURVATURE and step_count % DEBUG_STEP_INTERVAL == 0:
+            print(f"    Step {step_count}: Z={z:.4f}m, θ={theta/(2*np.pi):.2f} rev, κ={kappa_current:.3f} 1/m, pitch={pitch*1000:.2f}mm")
 
     print(f"  Generated {step_count} points, {theta/(2*np.pi):.2f} rotations")
+    print(f"  Pitch clamping: MAX={pitch_max_count} ({pitch_max_count/step_count*100:.1f}%), MIN={pitch_min_count} ({pitch_min_count/step_count*100:.1f}%)")
 
     # Convert to numpy array
     positions = np.array(trajectory_list)
@@ -612,18 +734,37 @@ def generate_adaptive_helical_curve(
     # Combine into trajectory
     trajectory = np.column_stack([tcp_points, blade_states])
 
-    # Statistics on adaptive pitch
+    # Statistics on adaptive pitch and curvature
     pitches = np.array(pitches)
+    curvatures = np.array(curvatures)
+
     print(f"\n  Adaptive pitch statistics:")
     print(f"    Mean: {np.mean(pitches)*1000:.2f}mm")
     print(f"    Min:  {np.min(pitches)*1000:.2f}mm")
     print(f"    Max:  {np.max(pitches)*1000:.2f}mm")
     print(f"    Std:  {np.std(pitches)*1000:.2f}mm")
 
+    # Detailed statistics (debug mode)
+    if DEBUG_CURVATURE:
+        print(f"\n  Curvature statistics (sampled along path):")
+        print(f"    Mean: {np.mean(curvatures):.3f} 1/m")
+        print(f"    Min:  {np.min(curvatures):.3f} 1/m")
+        print(f"    Max:  {np.max(curvatures):.3f} 1/m")
+        print(f"    Std:  {np.std(curvatures):.3f} 1/m")
+
+        print(f"\n  Curvature-Pitch relationship:")
+        low_curv_mask = curvatures < np.percentile(curvatures, 25)
+        high_curv_mask = curvatures > np.percentile(curvatures, 75)
+        print(f"    Low curvature (25%): κ={np.mean(curvatures[low_curv_mask]):.3f} 1/m → pitch={np.mean(pitches[low_curv_mask])*1000:.2f}mm")
+        print(f"    High curvature (75%): κ={np.mean(curvatures[high_curv_mask]):.3f} 1/m → pitch={np.mean(pitches[high_curv_mask])*1000:.2f}mm")
+
     return trajectory, r_max
 
 
-# -------- Spline Smoothing --------
+# ========================================
+# 6. POST-PROCESSING
+# ========================================
+
 def smooth_curve_with_spline(
     trajectory: np.ndarray,
     smoothing_factor: float = SPLINE_SMOOTHING
@@ -667,7 +808,10 @@ def smooth_curve_with_spline(
         return trajectory
 
 
-# -------- Visualization --------
+# ========================================
+# 7. VISUALIZATION
+# ========================================
+
 def visualize_trajectory(
     mesh: trimesh.Trimesh,
     trajectory: np.ndarray,
@@ -733,7 +877,10 @@ def visualize_trajectory(
     )
 
 
-# -------- Export --------
+# ========================================
+# 8. FILE I/O
+# ========================================
+
 def export_trajectory(trajectory: np.ndarray, output_path: str) -> None:
     """
     Export trajectory to CSV file
@@ -749,7 +896,10 @@ def export_trajectory(trajectory: np.ndarray, output_path: str) -> None:
     print(f"  {len(trajectory)} points")
 
 
-# -------- Main Pipeline --------
+# ========================================
+# 9. MAIN PIPELINE
+# ========================================
+
 def main():
     """Main trajectory generation pipeline"""
     print("=" * 70)
