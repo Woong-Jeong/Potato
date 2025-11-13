@@ -27,10 +27,13 @@ OUTPUT_PATH = "../output/peeling_trajectory_adaptive.csv"
 NUM_Z_SLICES = 240          # Z-direction slices for cylindrical profile
 NUM_THETA_SAMPLES = 360     # Angular samples (1 degree resolution)
 
+# -------- Tool Geometry --------
+TOOL_WIDTH = 0.030       # Tool diameter: 30mm
+
 # -------- ISO-scallop Adaptive Pitch Parameters --------
-H_SCALLOP = 0.003           # Target scallop height: 3mm (surface quality)
+H_SCALLOP = 0.001           # Target scallop height: 1mm (surface quality)
 PITCH_MIN = 0.001           # Minimum pitch: 1mm (high curvature regions)
-PITCH_MAX = 0.027           # Maximum pitch: 27mm (low curvature regions)
+PITCH_MAX = TOOL_WIDTH * 0.8           # Maximum pitch: 24mm (≈80% tool size)
                             # NOTE: Independent of tool size in ISO-scallop theory
 
 # -------- Fixed Pitch Parameters (Non-Adaptive Mode) --------
